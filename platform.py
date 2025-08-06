@@ -160,7 +160,7 @@ def safe_copy_directory(src: str, dst: str) -> bool:
     return True
 
 
-class Espressif32Platform(PlatformBase):
+class Fobeespressif32Platform(PlatformBase):
     """ESP32 platform implementation for PlatformIO with optimized toolchain management."""
 
     def __init__(self, *args, **kwargs):
