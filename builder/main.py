@@ -13,15 +13,13 @@
 # limitations under the License.
 
 import locale
-import json
 import os
 import re
-import site
-import semantic_version
 import shlex
 import subprocess
 import sys
 from os.path import isfile, join
+from pathlib import Path
 
 from SCons.Script import (
     ARGUMENTS,
@@ -33,33 +31,9 @@ from SCons.Script import (
 )
 
 from platformio.project.helpers import get_project_dir
-from platformio.package.version import pepver_to_semver
 from platformio.util import get_serial_ports
 from platformio.compat import IS_WINDOWS
-
-# Check Python version requirement
-if sys.version_info < (3, 10):
-    sys.stderr.write(
-        f"Error: Python 3.10 or higher is required. "
-        f"Current version: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n"
-        f"Please update your Python installation.\n"
-    )
-    sys.exit(1)
-
-# Python dependencies required for the build process
-python_deps = {
-    "uv": ">=0.1.0",
-    "pyyaml": ">=6.0.2",
-    "rich-click": ">=1.8.6",
-    "zopfli": ">=0.2.2",
-    "intelhex": ">=2.3.0",
-    "rich": ">=14.0.0",
-    "cryptography": ">=45.0.3",
-    "ecdsa": ">=0.19.1",
-    "bitstring": ">=4.3.1",
-    "reedsolo": ">=1.7.0",
-    "esp-idf-size": ">=1.6.1"
-}
+from penv_setup import setup_python_environment
 
 # Initialize environment and configuration
 env = DefaultEnvironment()
@@ -69,257 +43,8 @@ terminal_cp = locale.getpreferredencoding().lower()
 FRAMEWORK_DIR = platform.get_package_dir("framework-arduinoespressif32")
 platformio_dir = projectconfig.get("platformio", "core_dir")
 
-# Global Python executable path, replaced later with venv python path
-PYTHON_EXE = env.subst("$PYTHONEXE")
-penv_dir = os.path.join(platformio_dir, "penv")
-
-
-def get_executable_path(executable_name):
-    """
-    Get the path to an executable based on the penv_dir.
-    """
-    exe_suffix = ".exe" if IS_WINDOWS else ""
-    scripts_dir = "Scripts" if IS_WINDOWS else "bin"
-    
-    return os.path.join(penv_dir, scripts_dir, f"{executable_name}{exe_suffix}")
-
-
-def setup_pipenv_in_package():
-    """
-    Checks if 'penv' folder exists in platformio dir and creates virtual environment if not.
-    """
-    if not os.path.exists(penv_dir):
-        env.Execute(
-            env.VerboseAction(
-                '"$PYTHONEXE" -m venv --clear "%s"' % penv_dir,
-                "Creating pioarduino Python virtual environment: %s" % penv_dir,
-            )
-        )
-        assert os.path.isfile(
-            get_executable_path("pip")
-        ), "Error: Failed to create a proper virtual environment. Missing the `pip` binary!"
-
-
-# Setup virtual environment if needed
-setup_pipenv_in_package()
-
-# Set Python Scons Var to env Python
-penv_python = get_executable_path("python")
-env.Replace(PYTHONEXE=penv_python)
-PYTHON_EXE = penv_python
-
-# check for python binary, exit with error when not found
-assert os.path.isfile(PYTHON_EXE), f"Python executable not found: {PYTHON_EXE}"
-
-
-def setup_python_paths():
-    """Setup Python module search paths using the penv_dir."""    
-    # Add penv_dir to module search path
-    site.addsitedir(penv_dir)
-    
-    # Add site-packages directory
-    python_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    site_packages = (
-        os.path.join(penv_dir, "Lib", "site-packages") if IS_WINDOWS
-        else os.path.join(penv_dir, "lib", python_ver, "site-packages")
-    )
-    
-    if os.path.isdir(site_packages):
-        site.addsitedir(site_packages)
-
-
-setup_python_paths()
-
-# Set executable paths from tools
-esptool_binary_path = get_executable_path("esptool")
-uv_executable = get_executable_path("uv")
-
-
-def get_packages_to_install(deps, installed_packages):
-    """
-    Generator for Python packages that need to be installed.
-    
-    Args:
-        deps (dict): Dictionary of package names and version specifications
-        installed_packages (dict): Dictionary of currently installed packages
-        
-    Yields:
-        str: Package name that needs to be installed
-    """
-    for package, spec in deps.items():
-        if package not in installed_packages:
-            yield package
-        else:
-            version_spec = semantic_version.Spec(spec)
-            if not version_spec.match(installed_packages[package]):
-                yield package
-
-
-def install_python_deps():
-    """
-    Ensure uv package manager is available and install required Python dependencies.
-    
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    try:
-        result = subprocess.run(
-            [uv_executable, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=3
-        )
-        uv_available = result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        uv_available = False
-    
-    if not uv_available:
-        try:
-            result = subprocess.run(
-                [PYTHON_EXE, "-m", "pip", "install", "uv>=0.1.0", "-q", "-q", "-q"],
-                capture_output=True,
-                text=True,
-                timeout=30,  # 30 second timeout
-                env=os.environ  # Use current environment with venv Python
-            )
-            if result.returncode != 0:
-                if result.stderr:
-                    print(f"Error output: {result.stderr.strip()}")
-                return False
-
-        except subprocess.TimeoutExpired:
-            print("Error: uv installation timed out")
-            return False
-        except FileNotFoundError:
-            print("Error: Python executable not found")
-            return False
-        except Exception as e:
-            print(f"Error installing uv package manager: {e}")
-            return False
-
-    
-    def _get_installed_uv_packages():
-        """
-        Get list of installed packages using uv.
-        
-        Returns:
-            dict: Dictionary of installed packages with versions
-        """
-        result = {}
-        try:
-            cmd = [uv_executable, "pip", "list", "--format=json"]
-            result_obj = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                timeout=30,  # 30 second timeout
-                env=os.environ  # Use current environment with venv Python
-            )
-            
-            if result_obj.returncode == 0:
-                content = result_obj.stdout.strip()
-                if content:
-                    packages = json.loads(content)
-                    for p in packages:
-                        result[p["name"]] = pepver_to_semver(p["version"])
-            else:
-                print(f"Warning: uv pip list failed with exit code {result_obj.returncode}")
-                if result_obj.stderr:
-                    print(f"Error output: {result_obj.stderr.strip()}")
-                
-        except subprocess.TimeoutExpired:
-            print("Warning: uv pip list command timed out")
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"Warning: Could not parse package list: {e}")
-        except FileNotFoundError:
-            print("Warning: uv command not found")
-        except Exception as e:
-            print(f"Warning! Couldn't extract the list of installed Python packages: {e}")
-
-        return result
-
-    installed_packages = _get_installed_uv_packages()
-    packages_to_install = list(get_packages_to_install(python_deps, installed_packages))
-    
-    if packages_to_install:
-        packages_list = [f"{p}{python_deps[p]}" for p in packages_to_install]
-        
-        cmd = [
-            uv_executable, "pip", "install",
-            f"--python={PYTHON_EXE}",
-            "--quiet", "--upgrade"
-        ] + packages_list
-        
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,  # 30 second timeout for package installation
-                env=os.environ  # Use current environment with venv Python
-            )
-            
-            if result.returncode != 0:
-                print(f"Error: Failed to install Python dependencies (exit code: {result.returncode})")
-                if result.stderr:
-                    print(f"Error output: {result.stderr.strip()}")
-                return False
-                
-        except subprocess.TimeoutExpired:
-            print("Error: Python dependencies installation timed out")
-            return False
-        except FileNotFoundError:
-            print("Error: uv command not found")
-            return False
-        except Exception as e:
-            print(f"Error installing Python dependencies: {e}")
-            return False
-    
-    return True
-
-
-def install_esptool():
-    """
-    Install esptool from package folder "tool-esptoolpy" using uv package manager.
-
-    Raises:
-        SystemExit: If esptool installation fails
-    """
-    try:
-        subprocess.check_call(
-            [PYTHON_EXE, "-c", "import esptool"], 
-            stdout=subprocess.DEVNULL, 
-            stderr=subprocess.DEVNULL,
-            env=os.environ
-        )
-        return
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-
-    esptool_repo_path = env.subst(platform.get_package_dir("tool-esptoolpy") or "")
-    if not esptool_repo_path or not os.path.isdir(esptool_repo_path):
-        print("Error: esptool package directory not found")
-        sys.exit(1)
-
-    try:
-        subprocess.check_call([
-            uv_executable, "pip", "install", "--quiet",
-            f"--python={PYTHON_EXE}",
-            "-e", esptool_repo_path
-        ], env=os.environ)
-
-        return
-
-    except subprocess.CalledProcessError as e:
-        print(f"Error: Failed to install esptool: {e}")
-        sys.exit(1)
-
-
-# Install espressif32 Python dependencies
-install_python_deps()
-# Install esptool after dependencies
-install_esptool()
+# Setup Python virtual environment and get executable paths
+PYTHON_EXE, esptool_binary_path = setup_python_environment(env, platform, platformio_dir)
 
 
 def BeforeUpload(target, source, env):
@@ -690,11 +415,12 @@ def switch_off_ldf():
 # Initialize board configuration and MCU settings
 board = env.BoardConfig()
 mcu = board.get("build.mcu", "esp32")
+is_xtensa = mcu in ("esp32", "esp32s2", "esp32s3")
 toolchain_arch = "xtensa-%s" % mcu
 filesystem = board.get("build.filesystem", "littlefs")
 
 # Set toolchain architecture for RISC-V based ESP32 variants
-if mcu in ("esp32c2", "esp32c3", "esp32c5", "esp32c6", "esp32h2", "esp32p4"):
+if not is_xtensa:
     toolchain_arch = "riscv32-esp"
 
 # Initialize integration extra data if not present
@@ -702,7 +428,7 @@ if "INTEGRATION_EXTRA_DATA" not in env:
     env["INTEGRATION_EXTRA_DATA"] = {}
 
 # Take care of possible whitespaces in path
-objcopy_value = (
+uploader_path = (
     f'"{esptool_binary_path}"' 
     if ' ' in esptool_binary_path 
     else esptool_binary_path
@@ -722,21 +448,14 @@ env.Replace(
     GDB=join(
         platform.get_package_dir(
             "tool-riscv32-esp-elf-gdb"
-            if mcu in (
-                "esp32c2",
-                "esp32c3",
-                "esp32c5",
-                "esp32c6",
-                "esp32h2",
-                "esp32p4",
-            )
+            if not is_xtensa
             else "tool-xtensa-esp-elf-gdb"
         )
         or "",
         "bin",
         "%s-elf-gdb" % toolchain_arch,
     ),
-    OBJCOPY=objcopy_value,
+    OBJCOPY=uploader_path,
     RANLIB="%s-elf-gcc-ranlib" % toolchain_arch,
     SIZETOOL="%s-elf-size" % toolchain_arch,
     ARFLAGS=["rc"],
@@ -746,8 +465,8 @@ env.Replace(
     SIZECHECKCMD="$SIZETOOL -A -d $SOURCES",
     SIZEPRINTCMD="$SIZETOOL -B -d $SOURCES",
     ERASEFLAGS=["--chip", mcu, "--port", '"$UPLOAD_PORT"'],
-    ERASECMD='"$OBJCOPY" $ERASEFLAGS erase-flash',
-    # mkspiffs package contains two different binaries for IDF and Arduino
+    ERASETOOL=uploader_path,
+    ERASECMD='$ERASETOOL $ERASEFLAGS erase-flash',
     MKFSTOOL="mk%s" % filesystem
     + (
         (
@@ -792,7 +511,7 @@ env.Append(
             action=env.VerboseAction(
                 " ".join(
                     [
-                        "$OBJCOPY",
+                        "$ERASETOOL",
                         "--chip",
                         mcu,
                         "elf2image",
@@ -803,8 +522,8 @@ env.Append(
                         "--flash-size",
                         board.get("upload.flash_size", "4MB"),
                         "-o",
-                        "$TARGET",
-                        "$SOURCES",
+                        "\"$TARGET\"",
+                        "\"$SOURCES\"",
                     ]
                 ),
                 "Building $TARGET",
@@ -854,12 +573,12 @@ def firmware_metrics(target, source, env):
         print("Firmware metrics can not be shown. Set the terminal codepage to \"utf-8\"")
         return
 
-    map_file = os.path.join(env.subst("$BUILD_DIR"), env.subst("$PROGNAME") + ".map")
-    if not os.path.isfile(map_file):
+    map_file = str(Path(env.subst("$BUILD_DIR")) / (env.subst("$PROGNAME") + ".map"))
+    if not Path(map_file).is_file():
         # map file can be in project dir
-        map_file = os.path.join(get_project_dir(), env.subst("$PROGNAME") + ".map")
+        map_file = str(Path(get_project_dir()) / (env.subst("$PROGNAME") + ".map"))
 
-    if not os.path.isfile(map_file):
+    if not Path(map_file).is_file():
         print(f"Error: Map file not found: {map_file}")
         print("Make sure the project is built first with 'pio run'")
         return
@@ -878,7 +597,6 @@ def firmware_metrics(target, source, env):
             dash_index = sys.argv.index("--")
             if dash_index + 1 < len(sys.argv):
                 cli_args = sys.argv[dash_index + 1:]
-                cmd.extend(cli_args)
 
         # Add CLI arguments before the map file
         if cli_args:
@@ -896,16 +614,13 @@ def firmware_metrics(target, source, env):
         
         if result.returncode != 0:
             print(f"Warning: esp-idf-size exited with code {result.returncode}")
-            
-    except ImportError:
-        print("Error: esp-idf-size module not found.")
-        print("Install with: pip install esp-idf-size")
+
     except FileNotFoundError:
         print("Error: Python executable not found.")
         print("Check your Python installation.")
     except Exception as e:
         print(f"Error: Failed to run firmware metrics: {e}")
-        print("Make sure esp-idf-size is installed: pip install esp-idf-size")
+        print(f'Make sure esp-idf-size is installed: uv pip install --python "{PYTHON_EXE}" esp-idf-size')
 
 
 #
@@ -914,12 +629,12 @@ def firmware_metrics(target, source, env):
 
 target_elf = None
 if "nobuild" in COMMAND_LINE_TARGETS:
-    target_elf = join("$BUILD_DIR", "${PROGNAME}.elf")
+    target_elf = str(Path("$BUILD_DIR") / "${PROGNAME}.elf")
     if set(["uploadfs", "uploadfsota"]) & set(COMMAND_LINE_TARGETS):
         fetch_fs_size(env)
-        target_firm = join("$BUILD_DIR", "${ESP32_FS_IMAGE_NAME}.bin")
+        target_firm = str(Path("$BUILD_DIR") / "${ESP32_FS_IMAGE_NAME}.bin")
     else:
-        target_firm = join("$BUILD_DIR", "${PROGNAME}.bin")
+        target_firm = str(Path("$BUILD_DIR") / "${PROGNAME}.bin")
 else:
     target_elf = env.BuildProgram()
     silent_action = env.Action(firmware_metrics)
@@ -928,12 +643,12 @@ else:
     env.AddPostAction(target_elf, silent_action)
     if set(["buildfs", "uploadfs", "uploadfsota"]) & set(COMMAND_LINE_TARGETS):
         target_firm = env.DataToBin(
-            join("$BUILD_DIR", "${ESP32_FS_IMAGE_NAME}"), "$PROJECT_DATA_DIR"
+            str(Path("$BUILD_DIR") / "${ESP32_FS_IMAGE_NAME}"), "$PROJECT_DATA_DIR"
         )
         env.NoCache(target_firm)
         AlwaysBuild(target_firm)
     else:
-        target_firm = env.ElfToBin(join("$BUILD_DIR", "${PROGNAME}"), target_elf)
+        target_firm = env.ElfToBin(str(Path("$BUILD_DIR") / "${PROGNAME}"), target_elf)
         env.Depends(target_firm, "checkprogsize")
 
 # Configure platform targets
@@ -963,7 +678,7 @@ target_size = env.AddPlatformTarget(
 )
 
 # Target: Upload firmware or FS image
-upload_protocol = env.subst("$UPLOAD_PROTOCOL")
+upload_protocol = env.subst("$UPLOAD_PROTOCOL") or "esptool"
 debug_tools = board.get("debug.tools", {})
 upload_actions = []
 
@@ -991,7 +706,7 @@ if upload_protocol == "espota":
             "espressif32.html#over-the-air-ota-update\n"
         )
     env.Replace(
-        UPLOADER=join(FRAMEWORK_DIR, "tools", "espota.py"),
+        UPLOADER=str(Path(FRAMEWORK_DIR).resolve() / "tools" / "espota.py"),
         UPLOADERFLAGS=["--debug", "--progress", "-i", "$UPLOAD_PORT"],
         UPLOADCMD=f'"{PYTHON_EXE}" "$UPLOADER" $UPLOADERFLAGS -f $SOURCE',
     )
@@ -1002,7 +717,7 @@ if upload_protocol == "espota":
 # Configure upload protocol: esptool
 elif upload_protocol == "esptool":
     env.Replace(
-        UPLOADER=objcopy_value,
+        UPLOADER=uploader_path,
         UPLOADERFLAGS=[
             "--chip",
             mcu,
@@ -1051,7 +766,7 @@ elif upload_protocol == "esptool":
                 "detect",
                 "$FS_START",
             ],
-            UPLOADCMD='"$UPLOADER" $UPLOADERFLAGS $SOURCE',
+            UPLOADCMD='$UPLOADER $UPLOADERFLAGS $SOURCE',
         )
 
     upload_actions = [
@@ -1068,8 +783,8 @@ elif upload_protocol == "dfu":
     upload_actions = [env.VerboseAction("$UPLOADCMD", "Uploading $SOURCE")]
 
     env.Replace(
-        UPLOADER=join(
-            platform.get_package_dir("tool-dfuutil-arduino") or "", "dfu-util"
+        UPLOADER=str(
+            Path(platform.get_package_dir("tool-dfuutil-arduino")).resolve() / "dfu-util"
         ),
         UPLOADERFLAGS=[
             "-d",
