@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import locale
 import os
 import re
@@ -33,19 +34,49 @@ from SCons.Script import (
 from platformio.project.helpers import get_project_dir
 from platformio.util import get_serial_ports
 from platformio.compat import IS_WINDOWS
-from penv_setup import setup_python_environment
 
-# Initialize environment and configuration
+# Initialize SCons environment and project configuration
 env = DefaultEnvironment()
 platform = env.PioPlatform()
 projectconfig = env.GetProjectConfig()
 terminal_cp = locale.getpreferredencoding().lower()
-FRAMEWORK_DIR = platform.get_package_dir("framework-arduinoespressif32")
-platformio_dir = projectconfig.get("platformio", "core_dir")
+platform_dir = Path(env.PioPlatform().get_dir())
+framework_dir = platform.get_package_dir("framework-arduinoespressif32")
+core_dir = projectconfig.get("platformio", "core_dir")
+build_dir = Path(projectconfig.get("platformio", "build_dir"))
 
-# Setup Python virtual environment and get executable paths
-PYTHON_EXE, esptool_binary_path = setup_python_environment(env, platform, platformio_dir)
+# Configure Python environment through centralized platform management
+PYTHON_EXE, esptool_binary_path = platform.setup_python_env(env)
 
+# Load board configuration and determine MCU architecture
+board = env.BoardConfig()
+board_id = env.subst("$BOARD")
+mcu = board.get("build.mcu", "esp32")
+is_xtensa = mcu in ("esp32", "esp32s2", "esp32s3")
+toolchain_arch = "xtensa-%s" % mcu
+filesystem = board.get("build.filesystem", "littlefs")
+
+
+def load_board_script(env):
+    if not board_id:
+        return
+
+    script_path = platform_dir / "boards" / f"{board_id}.py"
+
+    if script_path.exists():
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"board_{board_id}", 
+                str(script_path)
+            )
+            board_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(board_module)
+
+            if hasattr(board_module, 'configure_board'):
+                board_module.configure_board(env)
+
+        except Exception as e:
+            print(f"Error loading board script {board_id}.py: {e}")
 
 def BeforeUpload(target, source, env):
     """
@@ -412,18 +443,14 @@ def switch_off_ldf():
         projectconfig.set(env_section, "lib_ldf_mode", "off")
 
 
-# Initialize board configuration and MCU settings
-board = env.BoardConfig()
-mcu = board.get("build.mcu", "esp32")
-is_xtensa = mcu in ("esp32", "esp32s2", "esp32s3")
-toolchain_arch = "xtensa-%s" % mcu
-filesystem = board.get("build.filesystem", "littlefs")
+# Board specific script
+load_board_script(env)
 
 # Set toolchain architecture for RISC-V based ESP32 variants
 if not is_xtensa:
     toolchain_arch = "riscv32-esp"
 
-# Initialize integration extra data if not present
+# Ensure integration extra data structure exists
 if "INTEGRATION_EXTRA_DATA" not in env:
     env["INTEGRATION_EXTRA_DATA"] = {}
 
@@ -433,7 +460,7 @@ uploader_path = (
     if ' ' in esptool_binary_path 
     else esptool_binary_path
 )
-# Configure build tools and environment variables
+# Configure SCons build tools and compiler settings
 env.Replace(
     __get_board_boot_mode=_get_board_boot_mode,
     __get_board_f_flash=_get_board_f_flash,
@@ -584,7 +611,7 @@ def firmware_metrics(target, source, env):
         return
 
     try:        
-        cmd = [PYTHON_EXE, "-m", "esp_idf_size", "--ng"]
+        cmd = [PYTHON_EXE, "-m", "esp_idf_size"]
         
         # Parameters from platformio.ini
         extra_args = env.GetProjectOption("custom_esp_idf_size_args", "")
@@ -609,7 +636,7 @@ def firmware_metrics(target, source, env):
         if env.GetProjectOption("custom_esp_idf_size_verbose", False):
             print(f"Running command: {' '.join(cmd)}")
         
-        # Call esp-idf-size with modified environment
+        # Execute esp-idf-size with current environment
         result = subprocess.run(cmd, check=False, capture_output=False, env=os.environ)
         
         if result.returncode != 0:
@@ -622,6 +649,132 @@ def firmware_metrics(target, source, env):
         print(f"Error: Failed to run firmware metrics: {e}")
         print(f'Make sure esp-idf-size is installed: uv pip install --python "{PYTHON_EXE}" esp-idf-size')
 
+
+def coredump_analysis(target, source, env):
+    """
+    Custom target to run esp-coredump with support for command line parameters.
+    Usage: pio run -t coredump -- [esp-coredump arguments]
+    
+    Args:
+        target: SCons target
+        source: SCons source
+        env: SCons environment object
+    """
+    if terminal_cp != "utf-8":
+        print("Coredump analysis can not be shown. Set the terminal codepage to \"utf-8\"")
+        return
+
+    elf_file = str(Path(env.subst("$BUILD_DIR")) / (env.subst("$PROGNAME") + ".elf"))
+    if not Path(elf_file).is_file():
+        # elf file can be in project dir
+        elf_file = str(Path(get_project_dir()) / (env.subst("$PROGNAME") + ".elf"))
+
+    if not Path(elf_file).is_file():
+        print(f"Error: ELF file not found: {elf_file}")
+        print("Make sure the project is built first with 'pio run'")
+        return
+
+    try:        
+        cmd = [PYTHON_EXE, "-m", "esp_coredump"]
+        
+        # Command Line Parameter, after --
+        cli_args = []
+        if "--" in sys.argv:
+            dash_index = sys.argv.index("--")
+            if dash_index + 1 < len(sys.argv):
+                cli_args = sys.argv[dash_index + 1:]
+
+        # Add CLI arguments or use defaults
+        if cli_args:
+            cmd.extend(cli_args)
+            # ELF file should be at the end as positional argument
+            if not any(arg.endswith('.elf') for arg in cli_args):
+                cmd.append(elf_file)
+        else:
+            # Default arguments if none provided
+            # Parameters from platformio.ini
+            extra_args = env.GetProjectOption("custom_esp_coredump_args", "")
+            if extra_args:
+                args = shlex.split(extra_args)
+                cmd.extend(args)
+                # Ensure ELF is last positional if not present
+                if not any(a.endswith(".elf") for a in args):
+                    cmd.append(elf_file)
+            else:
+                # Prefer an explicit core file if configured or present; else read from flash
+                core_file = env.GetProjectOption("custom_esp_coredump_corefile", "")
+                if not core_file:
+                    for name in ("coredump.bin", "coredump.b64"):
+                        cand = Path(get_project_dir()) / name
+                        if cand.is_file():
+                            core_file = str(cand)
+                            break
+
+                # Global options
+                cmd.extend(["--chip", mcu])
+                upload_port = env.subst("$UPLOAD_PORT")
+                if upload_port:
+                    cmd.extend(["--port", upload_port])
+
+                # Subcommand and arguments
+                cmd.append("info_corefile")
+                if core_file:
+                    cmd.extend(["--core", core_file])
+                    if core_file.lower().endswith(".b64"):
+                        cmd.extend(["--core-format", "b64"])
+                # ELF is the required positional
+                cmd.append(elf_file)
+
+        # Set up ESP-IDF environment variables and ensure required packages are installed
+        coredump_env = os.environ.copy()
+        
+        # Check if ESP-IDF packages are available, install if missing
+        _framework_pkg_dir = platform.get_package_dir("framework-espidf")
+        _rom_elfs_dir = platform.get_package_dir("tool-esp-rom-elfs")
+        
+        # Install framework-espidf if not available
+        if not _framework_pkg_dir or not os.path.isdir(_framework_pkg_dir):
+            print("ESP-IDF framework not found, installing...")
+            try:
+                platform.install_package("framework-espidf")
+                _framework_pkg_dir = platform.get_package_dir("framework-espidf")
+            except Exception as e:
+                print(f"Warning: Failed to install framework-espidf: {e}")
+        
+        # Install tool-esp-rom-elfs if not available
+        if not _rom_elfs_dir or not os.path.isdir(_rom_elfs_dir):
+            print("ESP ROM ELFs tool not found, installing...")
+            try:
+                platform.install_package("tool-esp-rom-elfs")
+                _rom_elfs_dir = platform.get_package_dir("tool-esp-rom-elfs")
+            except Exception as e:
+                print(f"Warning: Failed to install tool-esp-rom-elfs: {e}")
+        
+        # Set environment variables if packages are available
+        if _framework_pkg_dir and os.path.isdir(_framework_pkg_dir):
+            coredump_env['IDF_PATH'] = str(Path(_framework_pkg_dir).resolve())
+            if _rom_elfs_dir and os.path.isdir(_rom_elfs_dir):
+                coredump_env['ESP_ROM_ELF_DIR'] = str(Path(_rom_elfs_dir).resolve())
+
+        # Debug-Info if wanted
+        if env.GetProjectOption("custom_esp_coredump_verbose", False):
+            print(f"Running command: {' '.join(cmd)}")
+            if 'IDF_PATH' in coredump_env:
+                print(f"IDF_PATH: {coredump_env['IDF_PATH']}")
+                print(f"ESP_ROM_ELF_DIR: {coredump_env.get('ESP_ROM_ELF_DIR', 'Not set')}")
+        
+        # Execute esp-coredump with ESP-IDF environment
+        result = subprocess.run(cmd, check=False, capture_output=False, env=coredump_env)
+        
+        if result.returncode != 0:
+            print(f"Warning: esp-coredump exited with code {result.returncode}")
+
+    except FileNotFoundError:
+        print("Error: Python executable not found.")
+        print("Check your Python installation.")
+    except Exception as e:
+        print(f"Error: Failed to run coredump analysis: {e}")
+        print(f'Make sure esp-coredump is installed: uv pip install --python "{PYTHON_EXE}" esp-coredump')
 
 #
 # Target: Build executable and linkable firmware or FS image
@@ -706,7 +859,7 @@ if upload_protocol == "espota":
             "espressif32.html#over-the-air-ota-update\n"
         )
     env.Replace(
-        UPLOADER=str(Path(FRAMEWORK_DIR).resolve() / "tools" / "espota.py"),
+        UPLOADER=str(Path(framework_dir).resolve() / "tools" / "espota.py"),
         UPLOADERFLAGS=["--debug", "--progress", "-i", "$UPLOAD_PORT"],
         UPLOADCMD=f'"{PYTHON_EXE}" "$UPLOADER" $UPLOADERFLAGS -f $SOURCE',
     )
@@ -901,6 +1054,27 @@ env.AddCustomTarget(
     actions=firmware_metrics,
     title="Firmware Size Metrics (No Build)",
     description="Analyze firmware size without building first",
+    always_build=True,
+)
+
+# Register Custom Target for coredump analysis
+env.AddCustomTarget(
+    name="coredump",
+    dependencies="$BUILD_DIR/${PROGNAME}.elf",
+    actions=coredump_analysis,
+    title="Coredump Analysis",
+    description="Analyze coredumps using esp-coredump "
+    "(supports CLI args after --)",
+    always_build=True,
+)
+
+# Additional Target without Build-Dependency when already compiled
+env.AddCustomTarget(
+    name="coredump-only",
+    dependencies=None,
+    actions=coredump_analysis,
+    title="Coredump Analysis (No Build)",
+    description="Analyze coredumps without building first",
     always_build=True,
 )
 

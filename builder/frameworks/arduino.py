@@ -22,10 +22,10 @@ kinds of creative coding, interactive objects, spaces or physical experiences.
 http://arduino.cc/en/Reference/HomePage
 """
 
-import os
-import sys
-import shutil
 import hashlib
+import os
+import shutil
+import sys
 import threading
 from contextlib import suppress
 from os.path import join, exists, isabs, splitdrive, commonpath, relpath
@@ -565,7 +565,8 @@ FRAMEWORK_LIB_DIR = path_cache.framework_lib_dir
 
 SConscript("_embed_files.py", exports="env")
 
-flag_any_custom_sdkconfig = exists(str(Path(FRAMEWORK_LIB_DIR) / "sdkconfig"))
+flag_any_custom_sdkconfig = (FRAMEWORK_LIB_DIR is not None and 
+                            exists(str(Path(FRAMEWORK_LIB_DIR) / "sdkconfig")))
 
 
 def has_unicore_flags():
@@ -644,6 +645,8 @@ IS_INTEGRATION_DUMP = env.IsIntegrationDump()
 def is_framework_subfolder(potential_subfolder):
     """Check if a path is a subfolder of the framework SDK directory"""
     # carefully check before change this function
+    if FRAMEWORK_SDK_DIR is None:
+        return False
     if not isabs(potential_subfolder):
         return False
     if (splitdrive(FRAMEWORK_SDK_DIR)[0] !=
@@ -886,7 +889,7 @@ if check_reinstall_frwrk():
 if flag_custom_sdkconfig and not flag_any_custom_sdkconfig:
     call_compile_libs()
 
-# Main logic for Arduino Framework
+# Arduino framework configuration and build logic
 pioframework = env.subst("$PIOFRAMEWORK")
 arduino_lib_compile_flag = env.subst("$ARDUINO_LIB_COMPILE_FLAG")
 
